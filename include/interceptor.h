@@ -89,9 +89,8 @@ long interceptor_syscall(long syscall_number, ...);
  * progress, return -1.
  */
 pthread_t interceptor_attach_monitor(const pthread_attr_t *restrict attr,
-                                     void *(*monitor_fn)(void *), void *arg)
-    __nonnull((2));
-;
+                                     void *(*monitor_fn)(void *),
+                                     void *restrict arg) __nonnull((2));
 #define INTERCEPTOR_ATTACH_MONITOR_NOW(arg)                                    \
   interceptor_attach_monitor(interceptor_monitor_attr, interceptor_monitor_fn, \
                              arg)

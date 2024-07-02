@@ -16,46 +16,56 @@
 
 /* Static variables & functions */
 
-static uint32_t _exit_futex;
-static int _exit_wrapper(int status) {
-  /*
-   * It has to be a critical section, as it decreases
-   * `interceptor_pgstat->nr_thread`. (maybe `interceptor_pgstat->nr_tgrp` too)
-   *
-   * (should we use `USERSCHED_RESTART` here?)
-   */
-  log_verify_error(usersched_plock_pi(
-      &_exit_futex, FUTEX_PRIVATE_FLAG | USERSCHED_RESTART,
-      interceptor_tstat.tid, 100 * usersched_tsc_1us, NULL, NULL, NULL));
-
-  /* Check if exit_group() has been called by other in the thread group. */
-  if (interceptor_tgstat.nr_local_thread) {
-    __sync_fetch_and_sub(&interceptor_pgstat->nr_thread, 1);
-
-    const size_t __nr_local_thread =
-        __sync_fetch_and_sub(&interceptor_tgstat.nr_local_thread, 1);
-    if (__nr_local_thread <= 2) {
-      /* Check whether the monitor thread is still running. */
-      const pthread_t __monitor = __sync_val_compare_and_swap(
-          &interceptor_tgstat.monitor, interceptor_tgstat.monitor, -1);
-      if (__monitor && __monitor != -1 && __monitor != pthread_self()) {
-        /* Let the monitor thread terminate after releasing the lock. */
-        log_verify_errno(pthread_detach(__monitor));
-        log_verify_errno(pthread_cancel(__monitor));
-      }
-
-      /* Check whether this thread is the last one in the thread group. */
-      if (__nr_local_thread == 1)
-        __sync_fetch_and_sub(&interceptor_pgstat->nr_tgrp, 1);
-    }
-  }
-
-  log_verify_error(usersched_punlock_pi(&_exit_futex, FUTEX_PRIVATE_FLAG,
-                                        interceptor_tstat.tid, NULL));
-
-  return interceptor_syscall(SYS_exit, status);
+static int _syscall_wrapper_essential(long, long, long, long, long, long, long,
+                                      long *);
+static void _disable_syscall_wrapper() {
+  intercept_hook_point = _syscall_wrapper_essential;
 }
-static int _exit_group_wrapper(int status) {
+static int _syscall_wrapper(long, long, long, long, long, long, long, long *);
+static void _enable_syscall_wrapper() {
+  intercept_hook_point = _syscall_wrapper;
+}
+static int _within_hook() {
+  return intercept_hook_point == _syscall_wrapper ? 0 : 1;
+}
+
+static pthread_t _destruct_monitor(void **retval) {
+  /* Try to start the operation. */
+  const pthread_t __monitor = interceptor_tgstat.monitor;
+  if (__monitor && __monitor != -1 &&
+      __sync_val_compare_and_swap(&interceptor_tgstat.monitor, __monitor, -1) ==
+          __monitor) {
+    const int __within_hook = _within_hook();
+    _disable_syscall_wrapper();
+
+    /* This will invoke exit() syscall in the monitor thread. */
+    log_verify_errno(pthread_cancel(__monitor));
+
+    /* We need this stage to wait until the thread-related stats are updated. */
+    log_verify(({
+      int _ = pthread_join(__monitor, retval);
+      _ == 0 || _ == EINVAL;
+    }));
+
+    if (!__within_hook)
+      _enable_syscall_wrapper();
+  }
+  return __monitor;
+}
+static void _do_pre_exit_group() {
+  size_t __nr_local_thread;
+  do
+    __nr_local_thread = interceptor_tgstat.nr_local_thread;
+  while (__sync_val_compare_and_swap(&interceptor_tgstat.nr_local_thread,
+                                     __nr_local_thread,
+                                     0) != __nr_local_thread);
+  __sync_fetch_and_sub(&interceptor_pgstat->nr_thread,
+                       interceptor_tgstat.nr_local_thread);
+
+  __sync_fetch_and_sub(&interceptor_pgstat->nr_tgrp, 1);
+}
+static volatile uint32_t _exit_futex;
+static void _pre_exit_group_wrapper() {
   /*
    * It has to be a critical section, as it decreases
    * `interceptor_pgstat->nr_thread` with `interceptor_tgstat.nr_local_thread`
@@ -67,24 +77,38 @@ static int _exit_group_wrapper(int status) {
       &_exit_futex, FUTEX_PRIVATE_FLAG | USERSCHED_RESTART,
       interceptor_tstat.tid, 100 * usersched_tsc_1us, NULL, NULL, NULL));
 
-  __sync_fetch_and_sub(&interceptor_pgstat->nr_thread,
-                       interceptor_tgstat.nr_local_thread);
-  interceptor_tgstat.nr_local_thread = 0;
-  __sync_fetch_and_sub(&interceptor_pgstat->nr_tgrp, 1);
-
-  /* No need to take care of the monitor thread here. */
+  _do_pre_exit_group();
+}
+static int _exit_group_wrapper(int status) {
+  _pre_exit_group_wrapper();
 
   log_verify_error(usersched_punlock_pi(&_exit_futex, FUTEX_PRIVATE_FLAG,
                                         interceptor_tstat.tid, NULL));
 
   return interceptor_syscall(SYS_exit_group, status);
 }
+static int _exit_wrapper(int status) {
+  /*
+   * It has to be a critical section, as it decreases
+   * `interceptor_pgstat->nr_thread`. (maybe `interceptor_pgstat->nr_tgrp` too)
+   *
+   * (should we use `USERSCHED_RESTART` here?)
+   */
+  log_verify_error(usersched_plock_pi(
+      &_exit_futex, FUTEX_PRIVATE_FLAG | USERSCHED_RESTART,
+      interceptor_tstat.tid, 100 * usersched_tsc_1us, NULL, NULL, NULL));
 
-/*
- * All local threads share the same sigaction.
- * (see `man 2 clone` about CLONE_SIGHAND, CLONE_VM, and CLONE_THREAD)
- */
-static void _signal_wrapper(int sig, siginfo_t *info, void *context);
+  const size_t __nr_local_thread =
+      __sync_fetch_and_sub(&interceptor_pgstat->nr_thread, 1);
+  if (pthread_self() != interceptor_tgstat.monitor && __nr_local_thread <= 2) {
+  }
+
+  log_verify_error(usersched_punlock_pi(&_exit_futex, FUTEX_PRIVATE_FLAG,
+                                        interceptor_tstat.tid, NULL));
+
+  return interceptor_syscall(SYS_exit, status);
+}
+
 /* See `asm/signal.h`.*/
 struct kernel_sigaction {
   union {
@@ -96,17 +120,22 @@ struct kernel_sigaction {
   unsigned long sa_mask;
 };
 const size_t _sigsetsize = sizeof_elem(struct kernel_sigaction, sa_mask);
-static uint32_t _sigaction_futex;
-static struct kernel_sigaction _orig_ksa[NSIG];
+static volatile uint32_t _sigaction_futex;
+static void _signal_wrapper(int, siginfo_t *, void *);
 static __always_inline int
-_rt_sigaction(int signum, const struct kernel_sigaction *__restrict kact,
-              struct kernel_sigaction *__restrict oldkact, size_t sigsetsize) {
+_rt_sigaction(int signum, const struct kernel_sigaction *restrict kact,
+              struct kernel_sigaction *restrict oldkact, size_t sigsetsize) {
   return interceptor_syscall(SYS_rt_sigaction, signum, kact, oldkact,
                              sigsetsize);
 }
+/*
+ * All local threads share the same sigaction.
+ * (see `man 2 clone` about CLONE_SIGHAND, CLONE_VM, and CLONE_THREAD)
+ */
+static struct kernel_sigaction _orig_ksa[NSIG];
 static int _rt_sigaction_wrapper(int signum,
-                                 const struct kernel_sigaction *__restrict kact,
-                                 struct kernel_sigaction *__restrict oldkact,
+                                 const struct kernel_sigaction *restrict kact,
+                                 struct kernel_sigaction *restrict oldkact,
                                  size_t sigsetsize) {
   /* It is already AS-safe (i.e. all signal has been blocked; but why?). */
 
@@ -143,9 +172,10 @@ static int _rt_sigaction_wrapper(int signum,
 }
 
 void *restrict __altstack;
-static int _syscall_wrapper_essential(long syscall_number, long arg0, long arg1,
-                                      long arg2, long arg3, long arg4,
-                                      long arg5, long *result) {
+static __attribute((hot)) int
+_syscall_wrapper_essential(long syscall_number, long arg0, long arg1, long arg2,
+                           long arg3, long arg4, long arg5,
+                           long *restrict result) {
   /* No interceptable syscall() is allowed in this scope. */
 
   switch (syscall_number) {
@@ -172,7 +202,7 @@ static int _syscall_wrapper_essential(long syscall_number, long arg0, long arg1,
     return 1;
 
   case SYS_sigaltstack:
-    if (__altstack) {
+    if (unlikely(__altstack)) {
       *result = -(errno = EPERM); // ?
       break;
     }
@@ -183,20 +213,12 @@ static int _syscall_wrapper_essential(long syscall_number, long arg0, long arg1,
   return 0;
 }
 
-static void _disable_wrapper() {
-  intercept_hook_point = _syscall_wrapper_essential;
-}
 static thread_local
     __attribute((tls_model("initial-exec"))) long _apply_futex_workaround;
 static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
                                                long arg1, long arg2, long arg3,
                                                long arg4, long arg5,
-                                               long *result);
-static void _enable_wrapper() { intercept_hook_point = _syscall_wrapper; }
-static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
-                                               long arg1, long arg2, long arg3,
-                                               long arg4, long arg5,
-                                               long *result) {
+                                               long *restrict result) {
   /*
    * Intercept syscall instruction and save return value to `*result`.
    *
@@ -204,7 +226,7 @@ static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
    */
 
   /* Disable syscall interception. */
-  _disable_wrapper();
+  _disable_syscall_wrapper();
 
   /* Call the essential part of the wrapper first. */
   int __forward = _syscall_wrapper_essential(syscall_number, arg0, arg1, arg2,
@@ -224,7 +246,7 @@ static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
 
     if (arg1 == FUTEX_WAIT_PRIVATE) {
       *(uint32_t *)arg0 = 0;
-      *result = -(errno = 0);
+      *result = -(errno = 0); // ?
     }
   } else {
     /*
@@ -233,7 +255,7 @@ static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
      * Currently, we do not check `__forward` value before saving to `*result`.
      */
     long (*const __syscall_hook)(long, long, long, long, long, long, long,
-                                 int *restrict) = interceptor_syscall_hook;
+                                 int *) = interceptor_syscall_hook;
     if (likely(__syscall_hook)) {
       if ((*result = __syscall_hook(syscall_number, arg0, arg1, arg2, arg3,
                                     arg4, arg5, &__forward)) == -1)
@@ -243,21 +265,20 @@ static __attribute((hot)) int _syscall_wrapper(long syscall_number, long arg0,
   }
 
   /* Enable syscall interception again. */
-  _enable_wrapper();
+  _enable_syscall_wrapper();
 
   return __forward;
 }
 
-static int _within_hook() {
-  return intercept_hook_point == _syscall_wrapper ? 0 : 1;
-}
-static int _print_addr2line(void *data, uintptr_t pc, const char *filepath,
-                            int line, const char *func) {
+static int _print_addr2line(void *restrict data, uintptr_t pc,
+                            const char *restrict filepath, int line,
+                            const char *restrict func) {
   log(value_cast(data, int), "at 0x%lx: %s (%s:%d)", pc, func,
       filename(filepath), line);
   return 0;
 }
-static void _default_handler(int sig, siginfo_t *info, void *context) {
+static void _default_handler(int sig, const siginfo_t *restrict info,
+                             const void *restrict context) {
   const ucontext_t *const restrict __u = context;
   const long long __pc = __u->uc_mcontext.gregs[REG_RIP];
   Dl_info __info;
@@ -272,15 +293,37 @@ static void _default_handler(int sig, siginfo_t *info, void *context) {
   backtrace_pcinfo(__state, __pc, _print_addr2line, NULL, LOG_EMERG);
   log_backtrace(LOG_EMERG);
 }
-static __attribute((hot)) void _signal_wrapper(int sig, siginfo_t *info,
-                                               void *context) {
+static int __attribute((const)) _is_ign_sig(int sig) {
+  switch (sig) {
+  case SIGCHLD:
+  case SIGURG:
+  case SIGWINCH:
+    return 1;
+  }
+  return 0;
+}
+static int __attribute((const)) _is_term_sig(int sig) {
+  if (_is_ign_sig(sig))
+    return 0;
+  switch (sig) {
+  case SIGCONT:
+  case SIGSTOP:
+  case SIGTSTP:
+  case SIGTTIN:
+  case SIGTTOU:
+    return 0;
+  }
+  return 1;
+}
+static __attribute((hot)) void
+_signal_wrapper(int sig, siginfo_t *restrict info, void *restrict context) {
   const int __within_hook = _within_hook();
   /* Disable syscall interception. */
-  _disable_wrapper();
+  _disable_syscall_wrapper();
 
   /* Call user signal hook first (if possible). */
   int __forward = 0;
-  void (*const __signal_hook)(int, siginfo_t *, void *, int *restrict) =
+  void (*const __signal_hook)(int, siginfo_t *, void *, int *) =
       interceptor_signal_hook;
   if (likely(__signal_hook))
     __signal_hook(sig, info, context, &__forward);
@@ -313,6 +356,10 @@ static __attribute((hot)) void _signal_wrapper(int sig, siginfo_t *info,
     if (unlikely(!__ksa.sigaction_handler.kernel_sa_sigaction)) {
       _default_handler(sig, info, context);
 
+      /* Modify thread-related stats first. */
+      if (_is_term_sig(sig))
+        _pre_exit_group_wrapper();
+
       /* User did not set signal handler; Use default signal handler for now. */
       __ksa.sigaction_handler.kernel_sa_handler = SIG_DFL;
       log_verify_error(_rt_sigaction(sig, &__ksa, NULL, _sigsetsize));
@@ -329,26 +376,24 @@ static __attribute((hot)) void _signal_wrapper(int sig, siginfo_t *info,
       log_verify_error(_rt_sigaction(sig, &__ksa, NULL, _sigsetsize));
     } else {
       /* Call the saved custom signal handler. */
-      _enable_wrapper();
+      _enable_syscall_wrapper();
       __ksa.sigaction_handler.kernel_sa_sigaction(sig, info, context);
-      _disable_wrapper();
+      _disable_syscall_wrapper();
     }
   }
 
   /* Enable syscall interception again (if required). */
   if (!__within_hook)
-    _enable_wrapper();
+    _enable_syscall_wrapper();
 }
 
 /* clone() wrappers */
 
 static __attribute((hot)) void _clone_wrapper_child() {
-  __sync_add_and_fetch(&interceptor_pgstat->nr_thread, 1);
-  interceptor_tstat.thread_nr =
-      __sync_add_and_fetch(&interceptor_pgstat->cnt_thread, 1);
-
   const pid_t __parent_tgid = interceptor_tgstat.tgid;
   interceptor_tgstat.tgid = getpid();
+
+  __sync_add_and_fetch(&interceptor_pgstat->nr_thread, 1);
   const int __forked = interceptor_tgstat.tgid != __parent_tgid;
   if (__forked) {
     __sync_add_and_fetch(&interceptor_pgstat->nr_tgrp, 1);
@@ -357,11 +402,20 @@ static __attribute((hot)) void _clone_wrapper_child() {
     interceptor_tgstat.monitor = 0;
 
     _exit_futex = _sigaction_futex = 0;
-    barrier();
-  } else
-    __sync_add_and_fetch(&interceptor_tgstat.nr_local_thread, 1);
+    barrier(); // ?
+  } else {
+    size_t __nr_local_thread;
+    do
+      if ((__nr_local_thread = interceptor_tgstat.nr_local_thread))
+        pause(); // Do not allow to proceed.
+    while (__sync_val_compare_and_swap(
+               &interceptor_tgstat.nr_local_thread, __nr_local_thread,
+               __nr_local_thread + 1) != __nr_local_thread);
+  }
 
   interceptor_tstat.tid = gettid();
+  interceptor_tstat.thread_nr =
+      __sync_add_and_fetch(&interceptor_pgstat->cnt_thread, 1);
 
   void *__ret = NULL;
   void *(*const __clone_hook_child)(pid_t) = interceptor_clone_hook_child;
@@ -376,25 +430,23 @@ static __attribute((hot)) void _clone_wrapper_child() {
   }
 
   /* Reinitialize TLS variable. */
-  _enable_wrapper();
+  _enable_syscall_wrapper();
 }
 static __attribute((hot)) void _clone_wrapper_parent(long child_tid) {
-  /* Disable syscall interception. */
-  _disable_wrapper();
-
   void (*const __clone_hook_parent)(pid_t) = interceptor_clone_hook_parent;
-  if (likely(__clone_hook_parent))
+  if (likely(__clone_hook_parent)) {
+    /* Disable syscall interception. */
+    _disable_syscall_wrapper();
+
     __clone_hook_parent(child_tid);
 
-  /* Enable syscall interception again. */
-  _enable_wrapper();
+    /* Enable syscall interception again. */
+    _enable_syscall_wrapper();
+  }
 }
 
 /* Initialization */
 
-static int _ignored_signal(int sig) {
-  return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH;
-}
 int __valgrind;
 static void _signal_wrapper_init() {
   const char *__env = getenv("INTERCEPTOR_ALTSTACK");
@@ -407,7 +459,7 @@ static void _signal_wrapper_init() {
      * (also, see https://www.man7.org/linux/man-pages/man7/nptl.7.html)
      */
     if (likely((i <= SIGSYS || i >= SIGRTMIN) && i != SIGKILL && i != SIGSTOP &&
-               !_ignored_signal(i))) {
+               !_is_ign_sig(i))) {
       struct sigaction __osa;
       log_verify_error(sigaction(i, NULL, &__osa));
 
@@ -440,7 +492,7 @@ static void _signal_wrapper_init() {
     const stack_t __ss = {
         .ss_size = __altstack_size,
         .ss_sp = __altstack,
-#define SS_AUTODISARM (1U << 31)
+#define SS_AUTODISARM (1U << 31) // See `linux/signal.h`.
         .ss_flags = __valgrind ? 0 : SS_AUTODISARM,
     };
     log_verify_error(sigaltstack(&__ss, NULL));
@@ -471,13 +523,13 @@ static __attribute((constructor(101))) void _constructor() {
     intercept_hook_point_clone_child = _clone_wrapper_child;
     intercept_hook_point_clone_parent = _clone_wrapper_parent;
 
+    /* Start system call interception. */
+    _enable_syscall_wrapper();
+
     /* Try early creation of new monitor thread if (somehow) possible. */
     void *(*const __monitor_fn)(void *) = interceptor_monitor_fn;
     if (__monitor_fn)
       interceptor_attach_monitor(interceptor_monitor_attr, __monitor_fn, NULL);
-
-    /* Start system call interception. */
-    _enable_wrapper();
   }
 }
 
@@ -526,50 +578,41 @@ long interceptor_syscall(long syscall_number, ...) {
 /* Functions for thread group monitor */
 
 pthread_t interceptor_attach_monitor(const pthread_attr_t *restrict attr,
-                                     void *(*monitor_fn)(void *), void *arg) {
-  pthread_t __ret =
+                                     void *(*monitor_fn)(void *),
+                                     void *restrict arg) {
+  pthread_t __monitor =
       __sync_val_compare_and_swap(&interceptor_tgstat.monitor, 0, -1);
-  if (!__ret) {
+  if (likely(!__monitor)) {
     const int __within_hook = _within_hook();
 
     /* Ensure the futex workaround is applied in this scope only. */
     as_enter();
     _apply_futex_workaround = 1;
-    _enable_wrapper();
+    _enable_syscall_wrapper();
 
     /* Attach the new monitor thread. */
-    log_verify_errno(pthread_create((pthread_t *)&interceptor_tgstat.monitor,
-                                    attr, monitor_fn, arg));
+    log_verify_errno(pthread_create(&__monitor, attr, monitor_fn, arg));
 
     if (__within_hook)
-      _disable_wrapper();
+      _disable_syscall_wrapper();
     _apply_futex_workaround = 0;
     as_exit();
 
-    __ret = interceptor_tgstat.monitor;
+    interceptor_tgstat.monitor = __monitor;
+    barrier(); // ?
   }
-  return __ret;
+  return __monitor;
 }
 pthread_t interceptor_destruct_monitor(void **retval) {
   /* Try to start the operation. */
-  const pthread_t __monitor = __sync_val_compare_and_swap(
-      &interceptor_tgstat.monitor, interceptor_tgstat.monitor, -1);
-  if (__monitor && __monitor != -1) {
-    const int __within_hook = _within_hook();
-    _disable_wrapper();
+  const pthread_t __monitor = _destruct_monitor(retval);
 
-    /* This will invoke exit() syscall in the monitor thread. */
-    log_verify_errno(pthread_cancel(__monitor));
-
-    /* We need this stage to wait until the thread-related stats are updated. */
-    log_verify_errno(pthread_join(__monitor, retval));
-
-    if (!__within_hook)
-      _enable_wrapper();
-
-    /* Mark that the operation is completed. */
+  /* Mark that the operation is completed. */
+  if (__monitor == interceptor_tgstat.monitor) {
     interceptor_tgstat.monitor = 0;
+    barrier(); // ?
   }
+
   return __monitor;
 }
 
